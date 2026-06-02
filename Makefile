@@ -12,3 +12,7 @@ run: build
 script:
 	@chmod +x ./scripts/script.sh
 	@./scripts/script.sh
+
+clean:
+	@rm -r ./internal/bpf/*
+	@rm -r ./bin/*
