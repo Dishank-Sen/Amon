@@ -1,96 +1,177 @@
-//go:build ignore
+// go:build ignore
 
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 
-// map: child_pid → parent_pid
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10240);
-    __type(key, u32);    // child pid
-    __type(value, u32);  // parent pid
-} child_parent SEC(".maps");
-
-// map: comm string → 1 (exists = track this command)
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
-    __type(key, u8[16]);   // comm is max 16 bytes in Linux
-    __type(value, u32);    // just a flag, 1 = track
-} filter_root_comms SEC(".maps");
-
-// map: parent pid -> root pid
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 256);
-    __type(key, u32);   // parent pid
-    __type(value, u32);    // root pid
-} parent_root SEC(".maps");
-
 struct event {
-    u32 ppid;
-    u32 pid;
-    u32 rpid;
-    char child_comm[16];
-} __attribute__((packed));
+    __u32 pid;
+    __u32 tgid;
+    char comm[TASK_COMM_LEN];
+    char filename[256];
+};
 
-// Ring buffer map — the channel between kernel and userspace
+struct process_info {
+    u32 ppid;
+    u32 rpid;
+    char fork_comm[16];
+    char current_comm[16];
+};
+
+// map for allowed command to be filtered out
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, char[TASK_COMM_LEN]);
+    __type(value, __u8);
+} allowed_commands SEC(".maps");
+
+// map: child -> root
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, struct process_info);
+} child_root SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 24); // 16MB
+    __uint(max_entries, 1 << 24);
 } events SEC(".maps");
 
-SEC("tracepoint/sched/sched_process_fork")
-int handle_fork(struct trace_event_raw_sched_process_fork *ctx)
-{   
-    u8 comm[16];
+SEC("tracepoint/syscalls/sys_enter_openat")
+int trace_openat(struct trace_event_raw_sys_enter *ctx)
+{
+    char comm[TASK_COMM_LEN];
+
     bpf_get_current_comm(comm, sizeof(comm));
 
-    // check if this command is in our filter map
-    u32 *val = bpf_map_lookup_elem(&filter_root_comms, comm);
-    if (!val){
-        // check for parent comms
-        u32 ppid = ctx->parent_pid;
-        u32 *val = bpf_map_lookup_elem(&child_parent, &ppid);
+    __u8 *allowed = bpf_map_lookup_elem(
+        &allowed_commands,
+        &comm
+    );
 
-        if (!val) return 0;
+    if (!allowed)
+        return 0;   // process not in filter list
 
-        // get it's root pid from it's parent root pid
-        u32 *rpid = bpf_map_lookup_elem(&parent_root, &ppid);
+    struct event *e = bpf_ringbuf_reserve(
+        &events,
+        sizeof(*e),
+        0
+    );
 
-        // set the current process root pid as it's parent root pid
-        u32 pid = ctx->child_pid;
-        bpf_map_update_elem(&parent_root, pid, rpid, BPF_ANY);
-        // remove the parent from child_parent map
-        // bpf_map_delete_elem(&child_parent, &ppid);
+    if (!e)
+        return 0;
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+
+    e->pid = (__u32)pid_tgid;
+    e->tgid = (__u32)(pid_tgid >> 32);
+
+    __builtin_memcpy(e->comm, comm, sizeof(comm));
+
+    if (bpf_probe_read_user_str(
+            e->filename,
+            sizeof(e->filename),
+            (const char *)ctx->args[1]) < 0) {
+        bpf_ringbuf_discard(e, 0);
+        return 0;
     }
 
-    u32 parent_pid = ctx->parent_pid;
-    u32 child_pid  = ctx->child_pid;
+    bpf_ringbuf_submit(e, 0);
 
-    // record the relationship
-    bpf_map_update_elem(&child_parent, &child_pid, &parent_pid, BPF_ANY);
-
-    // in parent_root initial parent and root will be same
-    bpf_map_update_elem(&parent_root, &parent_pid, &parent_pid, BPF_ANY);
     return 0;
 }
 
-SEC("tracepoint/sys_enter_execve")
+SEC("tracepoint/syscalls/sys_exit_openat")
+int trace_openat_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    return 0;
+}
+
+// handles process tree creation
+SEC("tracepoint/sched/sched_process_fork")
+int handle_fork(struct trace_event_raw_sched_process_fork *ctx){
+    char comm[TASK_COMM_LEN];
+
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    __u8 *allowed = bpf_map_lookup_elem(
+        &allowed_commands,
+        &comm
+    );
+
+    if (allowed){
+        __u32 child_pid = ctx->child_pid;
+
+        struct process_info info = {
+            .rpid = ctx->parent_pid,
+            .ppid = ctx->parent_pid,
+        };
+
+        __builtin_memcpy(info.fork_comm,
+                        comm,
+                        sizeof(comm));
+
+        bpf_map_update_elem(
+            &child_root,
+            &child_pid,
+            &info,
+            BPF_ANY
+        );
+        return 0;
+    }
+
+    // check if it is a child process of allowed command
+    struct process_info *cp = bpf_map_lookup_elem(
+        &child_root,
+        &ctx->parent_pid
+    );
+
+    if (!cp)
+        return 0;
+
+    struct process_info info = {
+        .rpid = cp->rpid,
+        .ppid = ctx->parent_pid,
+    };
+
+    __builtin_memcpy(info.fork_comm,
+                    comm,
+                    sizeof(comm));
+
+    bpf_map_update_elem(
+        &child_root,
+        &ctx->child_pid,
+        &info,
+        BPF_ANY
+    );
+    return 0;
+}
+
+// it adds the child process name
+SEC("tracepoint/syscalls/sys_enter_execve")
 int handle_execve(struct trace_event_raw_sys_enter *ctx)
 {
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
 
-    // look up who spawned this process
-    u32 *parent = bpf_map_lookup_elem(&child_parent, &pid);
-    if (parent) {
-        // now you have pid + parent_pid + binary path all together
-        u32 *rpid = bpf_map_lookup_elem(&parent_root, &pid);
-        
-        struct event *e;
-        e->ppid = *parent;
-        e->pid = pid;
-        e->rpid = *rpid;
-        bpf_get_current_comm(e->child_comm, sizeof(e->child_comm));
-    }
+    struct process_info *info =
+        bpf_map_lookup_elem(&child_root, &pid);
+
+    if (!info)
+        return 0;
+
+    char comm[TASK_COMM_LEN];
+
+    if (bpf_get_current_comm(comm, sizeof(comm)) < 0)
+        return 0;
+
+    __builtin_memcpy(
+        info->current_comm,
+        comm,
+        sizeof(info->current_comm)
+    );
+
+    return 0;
 }
+
+char LICENSE[] SEC("license") = "GPL";

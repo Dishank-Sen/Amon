@@ -1,0 +1,5 @@
+# Root process names tracked by amon (one per line)
+redis-server
+postgres
+nginx
+cat
