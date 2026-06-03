@@ -205,32 +205,52 @@ func writeTxtReport(path string, report *CrashReport) error {
 	w("  Slow Ops:       %d (>100ms)\n", report.Stats.SlowCount)
 	w("\n")
 
-	w("EVENTS LEADING TO CRASH (oldest → newest)\n")
+	w("EVENTS LEADING TO CRASH (chronological, filtered for signal)\n")
+	w("═══════════════════════════════════════════════════════════════════\n")
+	w("NOTE: Only showing errors, slow operations, and recent context.\n")
+	w("      50,000 successful reads are not shown - failures are the signal.\n")
 	w("═══════════════════════════════════════════════════════════════════\n\n")
 
 	if len(report.Events) == 0 {
 		w("  (no events captured)\n\n")
 	} else {
+		const EINPROGRESS = 115
 		for i, evt := range report.Events {
-			w("[%4d] %s\n", i+1, strings.ToUpper(evt.Type))
+			// Mark errors prominently (but not EINPROGRESS)
+			marker := "    "
+			isAsync := evt.Ret == -EINPROGRESS
+			isError := evt.Ret < 0 && !isAsync
+			isSlow := evt.Latency > 100_000_000 && !isAsync
+
+			if isError {
+				marker = "❌  "
+			} else if isSlow {
+				marker = "⚠️  "
+			}
+
+			w("[%4d] %s%s\n", i+1, marker, strings.ToUpper(evt.Type))
 			w("       PID:       %d\n", evt.PID)
 			w("       Timestamp: %d ns\n", evt.Timestamp)
 
 			if evt.Latency > 0 {
 				latencyMs := float64(evt.Latency) / 1_000_000.0
 				w("       Latency:   %.2f ms", latencyMs)
-				if evt.Latency > 100_000_000 {
+				if isSlow {
 					w(" ⚠ SLOW")
 				}
 				w("\n")
 			}
 
 			if evt.Ret != 0 {
-				w("       Return:    %d", evt.Ret)
-				if evt.Ret < 0 {
-					w(" ❌ ERROR")
+				if isAsync {
+					w("       Return:    async (EINPROGRESS)\n")
+				} else {
+					w("       Return:    %d", evt.Ret)
+					if isError {
+						w(" ❌ ERROR")
+					}
+					w("\n")
 				}
-				w("\n")
 			}
 
 			if evt.File != nil {

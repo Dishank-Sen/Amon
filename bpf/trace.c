@@ -8,6 +8,7 @@
 #define EVENT_OPENAT  1
 #define EVENT_EXIT    2
 #define EVENT_CONNECT 3  // placeholder for future
+#define AF_INET  2
 
 // All events start with type field for Go dispatcher
 struct openat_event {
@@ -15,7 +16,8 @@ struct openat_event {
     __u32 pid;
     __u32 tgid;
     __u64 timestamp_ns;
-    __u64 enter_time_ns;  // for latency calculation
+    __u64 latency_ns;
+    __s64 ret;       // return value: fd on success, -errno on error
     char comm[TASK_COMM_LEN];
     char filename[256];
 } __attribute__((packed));
@@ -41,7 +43,33 @@ struct process_info {
     u32 rpid;
     char fork_comm[TASK_COMM_LEN];
     char current_comm[TASK_COMM_LEN];
-};
+} __attribute__((packed));
+
+struct connect_data {
+    __u32 pid;
+    __u64 timestamp;
+    __u16 family;
+    __u16 dport;     // destination port
+    __u32 daddr;     // destination IP (IPv4)
+} __attribute__((packed));
+
+struct connect_event {
+    __u32 type;
+    __u32 pid;
+    __u64 timestamp;
+    __u64 latency;
+    __s64 ret;
+    __u16 family;
+    __u16 dport;     // destination port
+    __u32 daddr;     // destination IP (IPv4)
+} __attribute__((packed));
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, struct connect_data);
+} connect_start SEC(".maps");
 
 // map for allowed command to be filtered out
 struct {
@@ -67,13 +95,19 @@ struct {
     __type(value, struct process_info);
 } child_root SEC(".maps");
 
-// map: track openat enter times for latency calculation
+// map: track openat enter info for latency and context
 // key: (pid << 32) | tid to handle multi-threaded processes
+struct openat_info {
+    __u64 enter_time;
+    char filename[256];
+    char comm[TASK_COMM_LEN];
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 10240);
     __type(key, __u64);
-    __type(value, __u64);
+    __type(value, struct openat_info);
 } openat_start SEC(".maps");
 
 // Single unified ring buffer for all events
@@ -161,36 +195,16 @@ static __always_inline int trace_open_common(struct trace_event_raw_sys_enter *c
         }
     }
 
-    // Record entry time for latency calculation
-    __u64 enter_time = bpf_ktime_get_ns();
-    bpf_map_update_elem(&openat_start, &pid_tgid, &enter_time, BPF_ANY);
+    // Store entry info for later (will emit event on exit with return value)
+    struct openat_info info = {};
+    info.enter_time = bpf_ktime_get_ns();
+    __builtin_memcpy(info.comm, comm, sizeof(info.comm));
 
-    struct openat_event *e = bpf_ringbuf_reserve(
-        &events,
-        sizeof(*e),
-        0
-    );
-
-    if (!e)
-        return 0;
-
-    e->type = EVENT_OPENAT;
-    e->pid = pid;
-    e->tgid = tgid;
-    e->timestamp_ns = enter_time;
-    e->enter_time_ns = enter_time;
-
-    __builtin_memcpy(e->comm, comm, sizeof(comm));
-
-    if (bpf_probe_read_user_str(
-            e->filename,
-            sizeof(e->filename),
-            fname) < 0) {
-        bpf_ringbuf_discard(e, 0);
+    if (bpf_probe_read_user_str(info.filename, sizeof(info.filename), fname) < 0) {
         return 0;
     }
 
-    bpf_ringbuf_submit(e, 0);
+    bpf_map_update_elem(&openat_start, &pid_tgid, &info, BPF_ANY);
 
     return 0;
 }
@@ -217,19 +231,39 @@ SEC("tracepoint/syscalls/sys_exit_openat")
 int trace_openat_exit(struct trace_event_raw_sys_exit *ctx){
     __u64 pid_tgid = bpf_get_current_pid_tgid();
 
-    // Look up the enter time
-    __u64 *enter_time = bpf_map_lookup_elem(&openat_start, &pid_tgid);
-    if (!enter_time)
+    // Look up the enter info
+    struct openat_info *info = bpf_map_lookup_elem(&openat_start, &pid_tgid);
+    if (!info)
         return 0;  // no matching enter event
 
     __u64 exit_time = bpf_ktime_get_ns();
-    __u64 latency = exit_time - *enter_time;
+    __u64 latency = exit_time - info->enter_time;
+    __s64 ret = ctx->ret;  // return value: fd >= 0 on success, -errno on error
+
+    // Emit complete event with return value and latency
+    struct openat_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        bpf_map_delete_elem(&openat_start, &pid_tgid);
+        return 0;
+    }
+
+    __u32 pid  = (__u32)pid_tgid;
+    __u32 tgid = pid_tgid >> 32;
+
+    e->type = EVENT_OPENAT;
+    e->pid = pid;
+    e->tgid = tgid;
+    e->timestamp_ns = exit_time;
+    e->latency_ns = latency;
+    e->ret = ret;
+
+    __builtin_memcpy(e->comm, info->comm, sizeof(e->comm));
+    __builtin_memcpy(e->filename, info->filename, sizeof(e->filename));
+
+    bpf_ringbuf_submit(e, 0);
 
     // Clean up the tracking entry
     bpf_map_delete_elem(&openat_start, &pid_tgid);
-
-    // TODO: emit a completion event with latency and return value
-    // For now we're emitting on enter, will refactor to emit on exit later
 
     return 0;
 }
@@ -377,6 +411,85 @@ int handle_exit(struct trace_event_raw_sched_process_exit *ctx)
     __builtin_memcpy(e->comm, comm, sizeof(e->comm));
 
     bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_enter_connect")
+int handle_connect_enter(struct trace_event_raw_sys_enter *ctx)
+{
+    // args[0] = fd
+    // args[1] = pointer to sockaddr struct (userspace)
+    // args[2] = length of sockaddr
+
+    struct sockaddr_in addr;
+
+    // read the sockaddr from userspace — NOT a direct dereference
+    if (bpf_probe_read_user(&addr, sizeof(addr),
+            (void *)ctx->args[1]) < 0)
+        return 0;
+
+    // only handle IPv4 for now — ignore unix sockets, IPv6 etc
+    if (addr.sin_family != AF_INET)
+        return 0;
+
+    // store entry data in hash map for exit handler to pick up
+    struct connect_data data = {};
+    data.pid       = bpf_get_current_pid_tgid() >> 32;
+    data.timestamp = bpf_ktime_get_ns();
+    data.family    = addr.sin_family;
+    data.dport     = __builtin_bswap16(addr.sin_port);  // convert big-endian to little-endian
+    data.daddr     = addr.sin_addr.s_addr;
+
+    bpf_map_update_elem(&connect_start, &data.pid, &data, BPF_ANY);
+    return 0;
+}
+
+SEC("tracepoint/syscalls/sys_exit_connect")
+int handle_connect_exit(struct trace_event_raw_sys_exit *ctx)
+{
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+
+    // look up entry data
+    struct connect_data *data = bpf_map_lookup_elem(&connect_start, &pid);
+    if (!data)
+        return 0;
+
+    // check ignored/allowed — same pattern as your file hooks
+    char comm[TASK_COMM_LEN];
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    __u8 *ignored = bpf_map_lookup_elem(&ignored_commands, &comm);
+    if (ignored) {
+        bpf_map_delete_elem(&connect_start, &pid);
+        return 0;
+    }
+
+    __u8 *allowed = bpf_map_lookup_elem(&allowed_commands, &comm);
+    if (!allowed) {
+        struct process_info *cp = bpf_map_lookup_elem(&child_root, &pid);
+        if (!cp){
+            bpf_map_delete_elem(&connect_start, &pid);
+            return 0;
+        }
+    }
+
+    // build the event
+    struct connect_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        bpf_map_delete_elem(&connect_start, &pid);
+        return 0;
+    }
+
+    e->type    = EVENT_CONNECT;
+    e->pid     = pid;
+    e->latency = bpf_ktime_get_ns() - data->timestamp;
+    e->ret     = ctx->ret;
+    e->dport   = data->dport;
+    e->daddr   = data->daddr;
+    e->family  = data->family;
+
+    bpf_ringbuf_submit(e, 0);
+    bpf_map_delete_elem(&connect_start, &pid);
     return 0;
 }
 

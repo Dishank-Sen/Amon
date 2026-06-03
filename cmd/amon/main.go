@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	utils "github.com/Dishank-Sen/Amon"
+	utils "github.com/Dishank-Sen/Amon/utils"
 	cb "github.com/Dishank-Sen/Amon/internal/circular_buffer"
 	"github.com/Dishank-Sen/Amon/internal/logger"
 	"github.com/Dishank-Sen/Amon/internal/paths"
@@ -27,51 +27,28 @@ const (
 	EVENT_OPENAT  = 1
 	EVENT_EXIT    = 2
 	EVENT_CONNECT = 3
+	EINPROGRESS   = 115
 )
 
-// All events are packed in C, so no padding in Go structs
-type OpenatEvent struct {
-	Type         uint32
-	Pid          uint32
-	Tgid         uint32
-	TimestampNs  uint64
-	EnterTimeNs  uint64
-	Comm         [16]byte
-	Filename     [256]byte
-}
-
-type ExitEvent struct {
-	Type        uint32
-	Pid         uint32
-	Tgid        uint32
-	Ppid        uint32
-
-	StartTimeNs uint64
-	ExitTimeNs  uint64
-
-	ExitCode int32
-	Signal   int32
-
-	GroupDead uint8
-	Comm      [16]byte
-}
-
 type Objs struct {
-    AllowedCommands *ebpf.Map     `ebpf:"allowed_commands"`
-    IgnoredCommands *ebpf.Map     `ebpf:"ignored_commands"`
-    TraceOpenat     *ebpf.Program `ebpf:"trace_openat"`
-    TraceOpen       *ebpf.Program `ebpf:"trace_open"`
-    TraceOpenat2    *ebpf.Program `ebpf:"trace_openat2"`
-    TraceOpenatExit *ebpf.Program `ebpf:"trace_openat_exit"`
-    HandleFork      *ebpf.Program `ebpf:"handle_fork"`
-    HandleExecve    *ebpf.Program `ebpf:"handle_execve"`
-    HandleExit      *ebpf.Program `ebpf:"handle_exit"`
-	Events          *ebpf.Map     `ebpf:"events"`
-	ChildRoot       *ebpf.Map     `ebpf:"child_root"`
-	OpenatStart     *ebpf.Map     `ebpf:"openat_start"`
+    AllowedCommands     *ebpf.Map     `ebpf:"allowed_commands"`
+    IgnoredCommands     *ebpf.Map     `ebpf:"ignored_commands"`
+    TraceOpenat         *ebpf.Program `ebpf:"trace_openat"`
+    TraceOpen           *ebpf.Program `ebpf:"trace_open"`
+    TraceOpenat2        *ebpf.Program `ebpf:"trace_openat2"`
+    TraceOpenatExit     *ebpf.Program `ebpf:"trace_openat_exit"`
+    HandleConnectEnter  *ebpf.Program `ebpf:"handle_connect_enter"`
+    HandleConnectExit   *ebpf.Program `ebpf:"handle_connect_exit"`
+    HandleFork          *ebpf.Program `ebpf:"handle_fork"`
+    HandleExecve        *ebpf.Program `ebpf:"handle_execve"`
+    HandleExit          *ebpf.Program `ebpf:"handle_exit"`
+	Events              *ebpf.Map     `ebpf:"events"`
+	ChildRoot           *ebpf.Map     `ebpf:"child_root"`
+	OpenatStart         *ebpf.Map     `ebpf:"openat_start"`
+	ConnectStart        *ebpf.Map     `ebpf:"connect_start"`
 }
 
-func isCrash(e ExitEvent) bool {
+func isCrash(e types.ExitEvent) bool {
     // Fatal signals that indicate crashes
     switch e.Signal {
     case 11: // SIGSEGV
@@ -106,8 +83,52 @@ func signalName(sig uint32) string {
     return fmt.Sprintf("SIG(%d)", sig)
 }
 
+func errorName(ret int64) string {
+	errorNames := map[int64]string{
+		// file errors
+		-2:   "ENOENT",
+		-13:  "EACCES",
+		-17:  "EEXIST",
+		-28:  "ENOSPC",
+		// network errors
+		-110: "ETIMEDOUT",
+		-111: "ECONNREFUSED",
+		-113: "EHOSTUNREACH",
+		-101: "ENETUNREACH",
+		-103: "ECONNABORTED",
+		-104: "ECONNRESET",
+		-115: "EINPROGRESS",
+	}
+	if name, ok := errorNames[ret]; ok {
+		return name
+	}
+	if ret < 0 {
+		return fmt.Sprintf("ERROR(%d)", ret)
+	}
+	return "ok"
+}
+
+func uint32ToIP(addr uint32) string {
+	return fmt.Sprintf("%d.%d.%d.%d",
+		addr&0xff,
+		(addr>>8)&0xff,
+		(addr>>16)&0xff,
+		(addr>>24)&0xff,
+	)
+}
+
+func isConnectError(ret int64) bool {
+	if ret == 0 {
+		return false // success
+	}
+	if ret == -EINPROGRESS {
+		return false // async connect — not an error
+	}
+	return true // everything else is a real error
+}
+
 func handleOpenatEvent(data []byte, registry *cb.ProcessRegistry) {
-	var e OpenatEvent
+	var e types.OpenatEvent
 	if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &e); err != nil {
 		return
 	}
@@ -115,30 +136,59 @@ func handleOpenatEvent(data []byte, registry *cb.ProcessRegistry) {
 	comm := string(bytes.TrimRight(e.Comm[:], "\x00"))
 	filename := string(bytes.TrimRight(e.Filename[:], "\x00"))
 
-	// Get or create circular buffer for this process
-	// Note: We don't have start_time here yet, will update when we add fork tracking
-	const bufferSize = 1000 // Keep last 1000 events per process
+	bufferSize := utils.GetEventThreshold()
 	buffer := registry.GetOrCreate(e.Tgid, 0, comm, e.TimestampNs, bufferSize)
 
-	// Create syscall event
+	// Create syscall event with actual return value and latency
 	syscallEvent := types.SyscallEvent{
 		Type:      "openat",
 		PID:       e.Tgid,
 		Timestamp: e.TimestampNs,
-		Latency:   0, // Will be updated on exit
-		Ret:       0, // Will be updated on exit
+		Latency:   e.LatencyNs,
+		Ret:       e.Ret,
 		File: &types.FileData{
 			Filename: filename,
 			Flags:    0, // TODO: capture flags from syscall args
-			FD:       0, // Will be updated on exit
+			FD:       int32(e.Ret), // fd on success, negative on error
 		},
 	}
 
 	buffer.Push(syscallEvent)
 }
 
-func handleExitEvent(data []byte, registry *cb.ProcessRegistry) {
-	var e ExitEvent
+func handleConnectEvent(data []byte, registry *cb.ProcessRegistry) {
+	var e types.ConnectEvent
+	if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &e); err != nil {
+		return
+	}
+
+	bufferSize := utils.GetEventThreshold()
+	buffer := registry.GetOrCreate(e.Pid, 0, "", e.Timestamp, bufferSize)
+
+	// Create syscall event with actual return value and latency
+	syscallEvent := types.SyscallEvent{
+		Type:      "connect",
+		PID:       e.Pid,
+		Timestamp: e.Timestamp,
+		Latency:   e.Latency,
+		Ret:       e.Ret,
+		Network: &types.NetworkData{
+			DstIP: [4]byte{
+				byte(e.Daddr & 0xff),
+				byte((e.Daddr >> 8) & 0xff),
+				byte((e.Daddr >> 16) & 0xff),
+				byte((e.Daddr >> 24) & 0xff),
+			},
+			DstPort: e.Dport,
+			FD:      int32(e.Ret), // socket fd on success, negative on error
+		},
+	}
+
+	buffer.Push(syscallEvent)
+}
+
+func handleExitEvent(data []byte, registry *cb.ProcessRegistry, trackedCommands map[string]bool) {
+	var e types.ExitEvent
 	if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &e); err != nil {
 		return
 	}
@@ -147,27 +197,39 @@ func handleExitEvent(data []byte, registry *cb.ProcessRegistry) {
 
 	// Only process crashes
 	if isCrash(e) {
-		logger.Crash(e.Tgid, comm, e.Signal)
+		// Check if this is an explicitly tracked process (not just a child)
+		isTrackedProcess := trackedCommands[comm]
 
-		// Retrieve the circular buffer for this crashed process
-		if buffer, ok := registry.Get(e.Tgid); ok {
-			// Generate crash reports
-			if err := reports.GenerateCrashReport(
-				e.Tgid,
-				e.Ppid,
-				comm,
-				e.ExitCode,
-				e.Signal,
-				e.ExitTimeNs,
-				buffer,
-			); err != nil {
-				logger.Error("Failed to generate crash report: %v", err)
+		if isTrackedProcess {
+			// Full crash report for explicitly tracked processes
+			logger.Crash(e.Tgid, comm, e.Signal)
+
+			// Retrieve the circular buffer for this crashed process
+			if buffer, ok := registry.Get(e.Tgid); ok {
+				// Generate crash reports
+				if err := reports.GenerateCrashReport(
+					e.Tgid,
+					e.Ppid,
+					comm,
+					e.ExitCode,
+					e.Signal,
+					e.ExitTimeNs,
+					buffer,
+				); err != nil {
+					logger.Error("Failed to generate crash report: %v", err)
+				}
+
+				// Clean up the buffer after crash
+				registry.Delete(e.Tgid)
+			} else {
+				logger.Warn("No event buffer found for crashed process PID=%d COMM=%s", e.Tgid, comm)
 			}
-
-			// Clean up the buffer after crash
-			registry.Delete(e.Tgid)
 		} else {
-			logger.Warn("No event buffer found for crashed process PID=%d COMM=%s", e.Tgid, comm)
+			// Just log child process crashes, don't generate full reports
+			logger.Debug("Child process crashed: PID=%d COMM=%s SIGNAL=%d (parent process context only)",
+				e.Tgid, comm, e.Signal)
+			// Still clean up the buffer
+			registry.Delete(e.Tgid)
 		}
 	}
 }
@@ -241,10 +303,13 @@ func main(){
 	defer objs.TraceOpen.Close()
 	defer objs.TraceOpenat2.Close()
 	defer objs.TraceOpenatExit.Close()
+	defer objs.HandleConnectEnter.Close()
+	defer objs.HandleConnectExit.Close()
 	defer objs.HandleFork.Close()
 	defer objs.HandleExecve.Close()
 	defer objs.HandleExit.Close()
 	defer objs.OpenatStart.Close()
+	defer objs.ConnectStart.Close()
 
 	objs.ChildRoot.Pin("/sys/fs/bpf/amon_child_root")
 	defer os.Remove("/sys/fs/bpf/amon_child_root")
@@ -257,8 +322,22 @@ func main(){
 	logger.Info("Config loaded: tracking %d commands, ignoring %d commands",
 		len(cfg.TrackedCommands), len(cfg.IgnoredCommands))
 
+	// Validate command names (Linux truncates to 15 chars)
+	for _, cmd := range cfg.TrackedCommands {
+		if len(cmd) > 15 {
+			logger.Warn("Command name '%s' is too long (%d chars, max 15). Kernel will truncate to '%s'",
+				cmd, len(cmd), cmd[:15])
+		}
+	}
+
 	if err := loadConfig(cfg, objs); err != nil{
 		logger.Fatal("Failed to load config into eBPF maps: %v", err)
+	}
+
+	// Create a map of tracked commands for quick lookup
+	trackedCommands := make(map[string]bool)
+	for _, cmd := range cfg.TrackedCommands {
+		trackedCommands[cmd] = true
 	}
 
 	// attach to open/openat/openat2 tracepoints
@@ -294,6 +373,41 @@ func main(){
 		logger.Fatal("Failed to attach openat2 tracepoint: %v", err)
 	}
 	defer tpOpenat2.Close()
+
+	// attach openat exit tracepoint for return values
+	tpOpenatExit, err := link.Tracepoint(
+		"syscalls",
+		"sys_exit_openat",
+		objs.TraceOpenatExit,
+		nil,
+	)
+	if err != nil {
+		logger.Fatal("Failed to attach openat exit tracepoint: %v", err)
+	}
+	defer tpOpenatExit.Close()
+
+	// attach connect tracepoints
+	tpConnectEnter, err := link.Tracepoint(
+		"syscalls",
+		"sys_enter_connect",
+		objs.HandleConnectEnter,
+		nil,
+	)
+	if err != nil {
+		logger.Fatal("Failed to attach connect enter tracepoint: %v", err)
+	}
+	defer tpConnectEnter.Close()
+
+	tpConnectExit, err := link.Tracepoint(
+		"syscalls",
+		"sys_exit_connect",
+		objs.HandleConnectExit,
+		nil,
+	)
+	if err != nil {
+		logger.Fatal("Failed to attach connect exit tracepoint: %v", err)
+	}
+	defer tpConnectExit.Close()
 
 	// attach fork and exec tracepoints
 	tpFork, err := link.Tracepoint(
@@ -375,8 +489,10 @@ func main(){
 			switch eventType {
 			case EVENT_OPENAT:
 				handleOpenatEvent(record.RawSample, registry)
+			case EVENT_CONNECT:
+				handleConnectEvent(record.RawSample, registry)
 			case EVENT_EXIT:
-				handleExitEvent(record.RawSample, registry)
+				handleExitEvent(record.RawSample, registry, trackedCommands)
 			default:
 				logger.Warn("Unknown event type: %d", eventType)
 			}

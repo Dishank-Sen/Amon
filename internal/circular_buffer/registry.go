@@ -25,12 +25,16 @@ func (r *ProcessRegistry) GetOrCreate(pid uint32, ppid uint32, comm string, star
     }
 
     buf := &CircularBuffer{
-        events:    make([]types.SyscallEvent, size),
-        size:      size,
-        PID:       pid,
-        PPID:      ppid,
-        Comm:      comm,
-        StartTime: startTime,
+        events:      make([]types.SyscallEvent, size),
+        size:        size,
+        errorEvents: make([]types.SyscallEvent, 0, 100), // keep up to 100 errors
+        slowEvents:  make([]types.SyscallEvent, 0, 100), // keep up to 100 slow ops
+        maxErrors:   100,
+        maxSlow:     100,
+        PID:         pid,
+        PPID:        ppid,
+        Comm:        comm,
+        StartTime:   startTime,
     }
     r.buffers[pid] = buf
     return buf
