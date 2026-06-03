@@ -2,8 +2,6 @@
 
 Amon is an eBPF-based crash forensics tool that automatically captures **stack traces**, **fault addresses**, and **syscall context** when processes crash, providing root cause analysis with zero configuration.
 
-**GitHub:** [https://github.com/Dishank-Sen/Amon](https://github.com/Dishank-Sen/Amon)
-
 ## Key Features
 
 ### 🔍 Crash Forensics
@@ -447,5 +445,3 @@ Amon answers the critical debugging questions:
 MIT License
 
 ---
-
-**For detailed technical documentation, see `/mnt/data/amon-plan/` directory.**
