@@ -5,17 +5,20 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 
-	utils "github.com/Dishank-Sen/Amon/utils"
 	cb "github.com/Dishank-Sen/Amon/internal/circular_buffer"
 	"github.com/Dishank-Sen/Amon/internal/logger"
 	"github.com/Dishank-Sen/Amon/internal/paths"
 	"github.com/Dishank-Sen/Amon/internal/reports"
+	"github.com/Dishank-Sen/Amon/internal/stacktrace"
 	"github.com/Dishank-Sen/Amon/types"
+	utils "github.com/Dishank-Sen/Amon/utils"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
@@ -27,25 +30,30 @@ const (
 	EVENT_OPENAT  = 1
 	EVENT_EXIT    = 2
 	EVENT_CONNECT = 3
+	EVENT_SIGNAL  = 4
 	EINPROGRESS   = 115
 )
 
 type Objs struct {
-    AllowedCommands     *ebpf.Map     `ebpf:"allowed_commands"`
-    IgnoredCommands     *ebpf.Map     `ebpf:"ignored_commands"`
-    TraceOpenat         *ebpf.Program `ebpf:"trace_openat"`
-    TraceOpen           *ebpf.Program `ebpf:"trace_open"`
-    TraceOpenat2        *ebpf.Program `ebpf:"trace_openat2"`
-    TraceOpenatExit     *ebpf.Program `ebpf:"trace_openat_exit"`
-    HandleConnectEnter  *ebpf.Program `ebpf:"handle_connect_enter"`
-    HandleConnectExit   *ebpf.Program `ebpf:"handle_connect_exit"`
-    HandleFork          *ebpf.Program `ebpf:"handle_fork"`
-    HandleExecve        *ebpf.Program `ebpf:"handle_execve"`
-    HandleExit          *ebpf.Program `ebpf:"handle_exit"`
-	Events              *ebpf.Map     `ebpf:"events"`
-	ChildRoot           *ebpf.Map     `ebpf:"child_root"`
-	OpenatStart         *ebpf.Map     `ebpf:"openat_start"`
-	ConnectStart        *ebpf.Map     `ebpf:"connect_start"`
+    AllowedCommands         *ebpf.Map     `ebpf:"allowed_commands"`
+    IgnoredCommands         *ebpf.Map     `ebpf:"ignored_commands"`
+    TraceOpenat             *ebpf.Program `ebpf:"trace_openat"`
+    TraceOpen               *ebpf.Program `ebpf:"trace_open"`
+    TraceOpenat2            *ebpf.Program `ebpf:"trace_openat2"`
+    TraceOpenatExit         *ebpf.Program `ebpf:"trace_openat_exit"`
+    HandleConnectEnter      *ebpf.Program `ebpf:"handle_connect_enter"`
+    HandleConnectExit       *ebpf.Program `ebpf:"handle_connect_exit"`
+    HandleFork              *ebpf.Program `ebpf:"handle_fork"`
+    HandleExecve            *ebpf.Program `ebpf:"handle_execve"`
+    HandleExit              *ebpf.Program `ebpf:"handle_exit"`
+    ProbeForceSigFault      *ebpf.Program `ebpf:"probe_force_sig_fault"`
+    HandleSignalDeliver     *ebpf.Program `ebpf:"handle_signal_deliver"`
+	Events                  *ebpf.Map     `ebpf:"events"`
+	ChildRoot               *ebpf.Map     `ebpf:"child_root"`
+	OpenatStart             *ebpf.Map     `ebpf:"openat_start"`
+	ConnectStart            *ebpf.Map     `ebpf:"connect_start"`
+	StackTraces             *ebpf.Map     `ebpf:"stack_traces"`
+	PendingSignals          *ebpf.Map     `ebpf:"pending_signals"`
 }
 
 func isCrash(e types.ExitEvent) bool {
@@ -156,6 +164,67 @@ func handleOpenatEvent(data []byte, registry *cb.ProcessRegistry) {
 	buffer.Push(syscallEvent)
 }
 
+// Store signal info per process (stack trace + fault address)
+type signalInfo struct {
+	stackTrace *stacktrace.StackTrace
+	faultAddr  uint64
+	siCode     int32
+	signal     uint32
+}
+
+var (
+	signalInfoMap   = make(map[uint32]*signalInfo)
+	signalInfoMutex sync.Mutex
+)
+
+func handleSignalEvent(data []byte, objs *Objs) {
+	var e types.SignalEvent
+	if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &e); err != nil {
+		return
+	}
+
+	comm := string(bytes.TrimRight(e.Comm[:], "\x00"))
+
+	logger.Debug("Signal captured: PID=%d SIGNAL=%d FAULT_ADDR=0x%x STACK_ID=%d",
+		e.Tgid, e.Signal, e.FaultAddr, e.StackID)
+
+	// Resolve stack trace
+	var trace *stacktrace.StackTrace
+	if e.StackID >= 0 {
+		// Read stack from BPF map
+		var stackPCs [20]uint64
+		if err := objs.StackTraces.Lookup(uint32(e.StackID), &stackPCs); err == nil {
+			// Convert to slice (stop at first 0)
+			pcs := []uint64{}
+			for _, pc := range stackPCs {
+				if pc == 0 {
+					break
+				}
+				pcs = append(pcs, pc)
+			}
+
+			if len(pcs) > 0 {
+				trace, _ = stacktrace.ResolveStackTrace(pcs, e.Tgid)
+			}
+		}
+	}
+
+	// Store signal info for this process
+	signalInfoMutex.Lock()
+	signalInfoMap[e.Tgid] = &signalInfo{
+		stackTrace: trace,
+		faultAddr:  e.FaultAddr,
+		siCode:     e.SiCode,
+		signal:     e.Signal,
+	}
+	signalInfoMutex.Unlock()
+
+	logger.Info("Crash signal: %s (PID %d) signal=%d fault_addr=0x%x", comm, e.Tgid, e.Signal, e.FaultAddr)
+	if trace != nil {
+		logger.Debug("Stack trace:\n%s", trace.Format())
+	}
+}
+
 func handleConnectEvent(data []byte, registry *cb.ProcessRegistry) {
 	var e types.ConnectEvent
 	if err := binary.Read(bytes.NewBuffer(data), binary.LittleEndian, &e); err != nil {
@@ -195,6 +264,9 @@ func handleExitEvent(data []byte, registry *cb.ProcessRegistry, trackedCommands 
 
 	comm := string(bytes.TrimRight(e.Comm[:], "\x00"))
 
+	log.Printf("exit: comm=%s pid=%d signal=%d exitcode=%d",
+        e.Comm, e.Pid, e.Signal, e.ExitCode)
+
 	// Only process crashes
 	if isCrash(e) {
 		// Check if this is an explicitly tracked process (not just a child)
@@ -204,18 +276,27 @@ func handleExitEvent(data []byte, registry *cb.ProcessRegistry, trackedCommands 
 			// Full crash report for explicitly tracked processes
 			logger.Crash(e.Tgid, comm, e.Signal)
 
+			// Retrieve stored signal info (stack trace + fault address)
+			signalInfoMutex.Lock()
+			sigInfo := signalInfoMap[e.Tgid]
+			delete(signalInfoMap, e.Tgid)
+			signalInfoMutex.Unlock()
+
+			// Convert to reports.SignalContext
+			var sigCtx *reports.SignalContext
+			if sigInfo != nil {
+				sigCtx = &reports.SignalContext{
+					StackTrace: sigInfo.stackTrace,
+					FaultAddr:  sigInfo.faultAddr,
+					SiCode:     sigInfo.siCode,
+					Signal:     sigInfo.signal,
+				}
+			}
+
 			// Retrieve the circular buffer for this crashed process
 			if buffer, ok := registry.Get(e.Tgid); ok {
-				// Generate crash reports
-				if err := reports.GenerateCrashReport(
-					e.Tgid,
-					e.Ppid,
-					comm,
-					e.ExitCode,
-					e.Signal,
-					e.ExitTimeNs,
-					buffer,
-				); err != nil {
+				// Generate crash reports with signal info
+				if err := reports.GenerateCrashReportWithStack(&e, buffer, sigCtx); err != nil {
 					logger.Error("Failed to generate crash report: %v", err)
 				}
 
@@ -444,7 +525,30 @@ func main(){
 	}
 	defer tpExit.Close()
 
-	logger.Info("All tracepoints attached successfully")
+	// attach signal delivery tracepoint for stack traces
+	tpSignal, err := link.Tracepoint(
+		"signal",
+		"signal_deliver",
+		objs.HandleSignalDeliver,
+		nil,
+	)
+	if err != nil {
+		logger.Fatal("Failed to attach signal_deliver tracepoint: %v", err)
+	}
+	defer tpSignal.Close()
+
+	// attach kprobe for fault address capture
+	kpForceSigFault, err := link.Kprobe(
+		"force_sig_fault",
+		objs.ProbeForceSigFault,
+		nil,
+	)
+	if err != nil {
+		logger.Fatal("Failed to attach force_sig_fault kprobe: %v", err)
+	}
+	defer kpForceSigFault.Close()
+
+	logger.Info("All tracepoints and kprobes attached successfully")
 
 	rd, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
@@ -491,6 +595,8 @@ func main(){
 				handleOpenatEvent(record.RawSample, registry)
 			case EVENT_CONNECT:
 				handleConnectEvent(record.RawSample, registry)
+			case EVENT_SIGNAL:
+				handleSignalEvent(record.RawSample, &objs)
 			case EVENT_EXIT:
 				handleExitEvent(record.RawSample, registry, trackedCommands)
 			default:

@@ -3,12 +3,24 @@
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_tracing.h>
 
 // Event type constants
 #define EVENT_OPENAT  1
 #define EVENT_EXIT    2
-#define EVENT_CONNECT 3  // placeholder for future
+#define EVENT_CONNECT 3
+#define EVENT_SIGNAL  4  // Signal delivery with stack trace
 #define AF_INET  2
+
+// Maximum stack depth to capture
+#define MAX_STACK_DEPTH 20
+
+// Signal context for crash forensics - define BEFORE exit_event
+struct signal_info {
+    __u64 fault_addr;    // si_addr for SIGSEGV/SIGBUS
+    __s32 si_code;       // signal code (SEGV_MAPERR, SEGV_ACCERR, etc)
+    __u32 _pad;
+} __attribute__((packed));
 
 // All events start with type field for Go dispatcher
 struct openat_event {
@@ -34,6 +46,9 @@ struct exit_event {
     __s32 exit_code;
     __s32 signal;
     __u8 group_dead;
+    __u8 _pad[3];
+
+    struct signal_info sig_info;
 
     char comm[TASK_COMM_LEN];
 } __attribute__((packed));
@@ -62,6 +77,21 @@ struct connect_event {
     __u16 family;
     __u16 dport;     // destination port
     __u32 daddr;     // destination IP (IPv4)
+} __attribute__((packed));
+
+// Signal delivery event with stack trace
+struct signal_event {
+    __u32 type;          // EVENT_SIGNAL
+    __u32 pid;
+    __u32 tgid;
+    __u32 signal;        // Signal number (11=SIGSEGV, etc)
+
+    __u64 timestamp_ns;
+    __u64 fault_addr;    // si_addr from siginfo_t
+    __s32 si_code;       // SEGV_MAPERR, SEGV_ACCERR, etc
+    __s32 stack_id;      // ID in stack map (-1 if capture failed)
+
+    char comm[TASK_COMM_LEN];
 } __attribute__((packed));
 
 struct {
@@ -116,6 +146,15 @@ struct {
     __uint(max_entries, 1 << 24);
 } events SEC(".maps");
 
+// Stack trace map - stores user-space stack traces
+// Key is stack_id, value is array of instruction pointers
+struct {
+    __uint(type, BPF_MAP_TYPE_STACK_TRACE);
+    __uint(max_entries, 1024);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, MAX_STACK_DEPTH * sizeof(__u64));
+} stack_traces SEC(".maps");
+
 static __always_inline int is_noise(const char *filename)
 {
     char buf[64];
@@ -125,36 +164,23 @@ static __always_inline int is_noise(const char *filename)
 
     int slen = len - 1; // excluding NUL
 
-    // common noisy prefixes
+    // common noisy prefixes - ONLY truly useless files
     if (slen >= 4 && buf[0] == '/' && buf[1] == 'd' && buf[2] == 'e' && buf[3] == 'v')
-        return 1;
+        return 1;  // /dev/* - never useful
     if (slen >= 5 && buf[0] == '/' && buf[1] == 'p' && buf[2] == 'r' && buf[3] == 'o' && buf[4] == 'c')
-        return 1;
+        return 1;  // /proc/* - never useful
     if (slen >= 4 && buf[0] == '/' && buf[1] == 's' && buf[2] == 'y' && buf[3] == 's')
-        return 1;
-    if (slen >= 5 && buf[0] == '/' && buf[1] == 'u' && buf[2] == 's' && buf[3] == 'r' && buf[4] == '/')
-        return 1; // /usr/lib, /usr/share, etc
-    if (slen >= 4 && buf[0] == '/' && buf[1] == 'l' && buf[2] == 'i' && buf[3] == 'b')
-        return 1; // /lib or /lib64
+        return 1;  // /sys/* - never useful
 
-    // /etc/ld.so.cache (16 chars)
-    if (slen >= 16 &&
-        buf[0] == '/' && buf[1] == 'e' && buf[2] == 't' && buf[3] == 'c' && buf[4] == '/' &&
-        buf[5] == 'l' && buf[6] == 'd' && buf[7] == '.' && buf[8] == 's' && buf[9] == 'o' &&
-        buf[10] == '.' && buf[11] == 'c' && buf[12] == 'a' && buf[13] == 'c' && buf[14] == 'h' && buf[15] == 'e')
-        return 1;
+    // REMOVED: /usr/* and /lib/* filters
+    // These are important for startup/crash context
 
-    // suffix-based noisy files (manual checks, no loops)
-    if (slen >= 3 && buf[slen-3] == '.' && buf[slen-2] == 's' && buf[slen-1] == 'o')
-        return 1; // .so
-    if (slen >= 5 && buf[slen-5] == '.' && buf[slen-4] == 's' && buf[slen-3] == 'o' && buf[slen-2] == '.' && buf[slen-1] == '0')
-        return 1; // .so.0
-    if (slen >= 3 && buf[slen-3] == '.' && buf[slen-2] == 'm' && buf[slen-1] == 'o')
-        return 1; // .mo
-    if (slen >= 6 && buf[slen-6] == '.' && buf[slen-5] == 'c' && buf[slen-4] == 'a' && buf[slen-3] == 'c' && buf[slen-2] == 'h' && buf[slen-1] == 'e')
-        return 1; // .cache
+    // REMOVED: .so, ld.so.cache, .mo filters
+    // These are important for understanding library loads and startup
+
+    // Keep only truly useless filters
     if (slen >= 10 && buf[slen-10] == '.' && buf[slen-9] == 'g' && buf[slen-8] == 'i' && buf[slen-7] == 't' && buf[slen-6] == 'c' && buf[slen-5] == 'o' && buf[slen-4] == 'n' && buf[slen-3] == 'f' && buf[slen-2] == 'i' && buf[slen-1] == 'g')
-        return 1; // .gitconfig
+        return 1; // .gitconfig - never relevant to crashes
 
     return 0;
 }
@@ -355,6 +381,120 @@ int handle_execve(struct trace_event_raw_sys_enter *ctx){
     return 0;
 }
 
+// Store signal info when signal is generated (before delivery)
+struct signal_context {
+    __u64 fault_addr;
+    __s32 si_code;
+    __u32 signal;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);  // tgid
+    __type(value, struct signal_context);
+} pending_signals SEC(".maps");
+
+// Kprobe on force_sig_fault - captures SIGSEGV/SIGBUS with fault address
+// This runs when the kernel generates the signal (at fault time)
+// force_sig_fault signature: int force_sig_fault(int sig, int code, void __user *addr)
+SEC("kprobe/force_sig_fault")
+int probe_force_sig_fault(struct pt_regs *ctx)
+{
+    // Read arguments from registers (x86-64 calling convention)
+    int sig = (int)PT_REGS_PARM1(ctx);
+    int code = (int)PT_REGS_PARM2(ctx);
+    void *addr = (void *)PT_REGS_PARM3(ctx);
+
+    // Only care about memory fault signals
+    if (sig != 11 && sig != 7)  // SIGSEGV, SIGBUS
+        return 0;
+
+    __u32 tgid = bpf_get_current_pid_tgid() >> 32;
+
+    char comm[TASK_COMM_LEN];
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    // Check if tracked
+    __u8 *allowed = bpf_map_lookup_elem(&allowed_commands, &comm);
+    if (!allowed) {
+        struct process_info *cp = bpf_map_lookup_elem(&child_root, &tgid);
+        if (!cp)
+            return 0;
+    }
+
+    // Store signal context for later retrieval
+    struct signal_context sig_ctx = {
+        .fault_addr = (__u64)addr,
+        .si_code = code,
+        .signal = sig,
+    };
+
+    bpf_map_update_elem(&pending_signals, &tgid, &sig_ctx, BPF_ANY);
+    return 0;
+}
+
+// Signal delivery tracepoint - captures crash with stack trace
+// This runs when signal is actually delivered to userspace
+SEC("tracepoint/signal/signal_deliver")
+int handle_signal_deliver(struct trace_event_raw_signal_deliver *ctx)
+{
+    __u32 sig = ctx->sig;
+
+    // Only capture crash signals (not SIGTERM, SIGKILL, etc)
+    if (sig != 11 && sig != 6 && sig != 7 && sig != 4 && sig != 8)
+        return 0;  // Not a crash signal
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 pid  = (__u32)pid_tgid;
+    __u32 tgid = pid_tgid >> 32;
+
+    char comm[TASK_COMM_LEN];
+    if (bpf_get_current_comm(comm, sizeof(comm)) < 0)
+        return 0;
+
+    // Check if this is an allowed/tracked process
+    __u8 *allowed = bpf_map_lookup_elem(&allowed_commands, &comm);
+    if (!allowed) {
+        struct process_info *cp = bpf_map_lookup_elem(&child_root, &tgid);
+        if (!cp)
+            return 0;  // Not tracked
+    }
+
+    // Capture user-space stack trace - THIS IS THE KEY
+    __s32 stack_id = bpf_get_stackid(ctx, &stack_traces, BPF_F_USER_STACK);
+
+    // Retrieve fault address from pending_signals map (stored by kprobe)
+    __u64 fault_addr = 0;
+    __s32 si_code = 0;
+
+    struct signal_context *sig_ctx = bpf_map_lookup_elem(&pending_signals, &tgid);
+    if (sig_ctx && sig_ctx->signal == sig) {
+        fault_addr = sig_ctx->fault_addr;
+        si_code = sig_ctx->si_code;
+        bpf_map_delete_elem(&pending_signals, &tgid);  // Clean up
+    }
+
+    // Emit signal event with stack trace
+    struct signal_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
+        return 0;
+
+    e->type = EVENT_SIGNAL;
+    e->pid = pid;
+    e->tgid = tgid;
+    e->signal = sig;
+    e->timestamp_ns = bpf_ktime_get_ns();
+    e->fault_addr = fault_addr;
+    e->si_code = si_code;
+    e->stack_id = stack_id;
+
+    __builtin_memcpy(e->comm, comm, sizeof(e->comm));
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
 SEC("tracepoint/sched/sched_process_exit")
 int handle_exit(struct trace_event_raw_sched_process_exit *ctx)
 {
@@ -407,6 +547,16 @@ int handle_exit(struct trace_event_raw_sched_process_exit *ctx)
     e->exit_code  = (raw_exit >> 8) & 0xff;
 
     e->group_dead = ctx->group_dead;
+
+    // Capture signal info for crash forensics
+    // Note: Directly reading siginfo from task_struct is tricky due to kernel API changes
+    // We'll rely on userspace analysis of /proc/pid/maps and heuristics
+    // The signal number itself provides significant information
+    e->sig_info.fault_addr = 0;
+    e->sig_info.si_code = 0;
+
+    // TODO: Future enhancement - use signal tracepoint instead of exit tracepoint
+    // to capture siginfo_t directly when the signal is delivered
 
     __builtin_memcpy(e->comm, comm, sizeof(e->comm));
 
@@ -480,13 +630,16 @@ int handle_connect_exit(struct trace_event_raw_sys_exit *ctx)
         return 0;
     }
 
-    e->type    = EVENT_CONNECT;
-    e->pid     = pid;
-    e->latency = bpf_ktime_get_ns() - data->timestamp;
-    e->ret     = ctx->ret;
-    e->dport   = data->dport;
-    e->daddr   = data->daddr;
-    e->family  = data->family;
+    __u64 exit_time = bpf_ktime_get_ns();
+
+    e->type      = EVENT_CONNECT;
+    e->pid       = pid;
+    e->timestamp = exit_time;          // FIX: set actual timestamp
+    e->latency   = exit_time - data->timestamp;
+    e->ret       = ctx->ret;
+    e->dport     = data->dport;
+    e->daddr     = data->daddr;
+    e->family    = data->family;
 
     bpf_ringbuf_submit(e, 0);
     bpf_map_delete_elem(&connect_start, &pid);

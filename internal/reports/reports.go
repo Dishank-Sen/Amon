@@ -1,6 +1,7 @@
 package reports
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	cb "github.com/Dishank-Sen/Amon/internal/circular_buffer"
+	"github.com/Dishank-Sen/Amon/internal/forensics"
+	"github.com/Dishank-Sen/Amon/internal/stacktrace"
 	"github.com/Dishank-Sen/Amon/types"
 )
 
@@ -104,16 +107,34 @@ func signalName(sig int32) string {
 	return fmt.Sprintf("SIG(%d)", sig)
 }
 
-// GenerateCrashReport creates both .txt and .jsonl reports
+// SignalContext contains stack trace and fault address from signal delivery
+type SignalContext struct {
+	StackTrace *stacktrace.StackTrace
+	FaultAddr  uint64
+	SiCode     int32
+	Signal     uint32
+}
+
+// GenerateCrashReport creates both .txt and .jsonl reports (legacy - no stack)
 func GenerateCrashReport(
-	pid uint32,
-	ppid uint32,
-	comm string,
-	exitCode int32,
-	signal int32,
-	exitTime uint64,
+	exitEvent *types.ExitEvent,
 	buffer *cb.CircularBuffer,
 ) error {
+	return GenerateCrashReportWithStack(exitEvent, buffer, nil)
+}
+
+// GenerateCrashReportWithStack creates reports with optional stack trace
+func GenerateCrashReportWithStack(
+	exitEvent *types.ExitEvent,
+	buffer *cb.CircularBuffer,
+	sigCtx *SignalContext,
+) error {
+	pid := exitEvent.Tgid
+	ppid := exitEvent.Ppid
+	comm := string(bytes.TrimRight(exitEvent.Comm[:], "\x00"))
+	exitCode := exitEvent.ExitCode
+	signal := exitEvent.Signal
+	exitTime := exitEvent.ExitTimeNs
 	crashDir, err := GetCrashDir()
 	if err != nil {
 		return fmt.Errorf("failed to get crash directory: %w", err)
@@ -132,7 +153,11 @@ func GenerateCrashReport(
 	jsonlPath := filepath.Join(crashDir, baseName+".jsonl")
 
 	// Prepare report data
-	events := buffer.Drain()
+	allEvents := buffer.Drain()
+
+	// Filter noise but track how much we removed
+	noiseCount := forensics.CountNoise(allEvents)
+	events := forensics.FilterNoise(allEvents)
 
 	report := CrashReport{
 		Events: events,
@@ -150,8 +175,17 @@ func GenerateCrashReport(
 	report.Stats.ErrorCount = buffer.ErrorCount
 	report.Stats.SlowCount = buffer.SlowCount
 
-	// Generate TXT report
-	if err := writeTxtReport(txtPath, &report); err != nil {
+	// Use fault address from signal context if available (more reliable)
+	faultAddr := exitEvent.SigInfo.FaultAddr
+	if sigCtx != nil && sigCtx.FaultAddr != 0 {
+		faultAddr = sigCtx.FaultAddr
+	}
+
+	// Perform crash analysis
+	analysis := forensics.AnalyzeCrash(signal, faultAddr, pid)
+
+	// Generate TXT report with stack trace
+	if err := writeTxtReport(txtPath, &report, analysis, sigCtx, noiseCount); err != nil {
 		return fmt.Errorf("failed to write txt report: %w", err)
 	}
 
@@ -167,7 +201,7 @@ func GenerateCrashReport(
 	return nil
 }
 
-func writeTxtReport(path string, report *CrashReport) error {
+func writeTxtReport(path string, report *CrashReport, analysis *forensics.CrashAnalysis, sigCtx *SignalContext, noiseCount int) error {
 	f, err := os.Create(path)
 	if err != nil {
 		return err
@@ -180,41 +214,116 @@ func writeTxtReport(path string, report *CrashReport) error {
 
 	w("═══════════════════════════════════════════════════════════════════\n")
 	w("                    AMON CRASH REPORT\n")
+	w("                    Forensic Analysis\n")
 	w("═══════════════════════════════════════════════════════════════════\n\n")
+
+	// CRASH ANALYSIS FIRST - answer "why did it crash?"
+	w("%s\n", analysis.Format())
+
+	// STACK TRACE - show where crash occurred
+	if sigCtx != nil && sigCtx.StackTrace != nil && len(sigCtx.StackTrace.Frames) > 0 {
+		w("STACK TRACE (at crash time)\n")
+		w("───────────────────────────────────────────────────────────────────\n")
+		w("%s\n", sigCtx.StackTrace.Format())
+	}
 
 	w("PROCESS INFORMATION\n")
 	w("───────────────────────────────────────────────────────────────────\n")
 	w("  Process:        %s\n", report.Process.Comm)
 	w("  PID:            %d\n", report.Process.PID)
 	w("  Parent PID:     %d\n", report.Process.PPID)
-	w("  Start Time:     %d ns (boot time)\n", report.Process.StartTime)
+
+	// Calculate process lifetime
+	var lifetimeSec float64
+	if report.Crash.Timestamp > report.Process.StartTime {
+		lifetimeNs := report.Crash.Timestamp - report.Process.StartTime
+		lifetimeSec = float64(lifetimeNs) / 1_000_000_000.0
+
+		if lifetimeSec < 1.0 {
+			w("  Lifetime:       %.1f ms\n", lifetimeSec*1000)
+		} else if lifetimeSec < 60 {
+			w("  Lifetime:       %.2f seconds\n", lifetimeSec)
+		} else {
+			minutes := int(lifetimeSec / 60)
+			seconds := lifetimeSec - float64(minutes*60)
+			w("  Lifetime:       %dm %.1fs\n", minutes, seconds)
+		}
+	} else {
+		w("  Lifetime:       unknown\n")
+	}
+
+	w("  Crash Time:     %s\n", report.Crash.TimestampISO)
 	w("\n")
 
-	w("CRASH DETAILS\n")
-	w("───────────────────────────────────────────────────────────────────\n")
-	w("  Time:           %s\n", report.Crash.TimestampISO)
-	w("  Signal:         %s (%d)\n", report.Crash.SignalName, report.Crash.Signal)
-	w("  Exit Code:      %d\n", report.Crash.ExitCode)
-	w("\n")
-
-	w("STATISTICS\n")
+	w("EVENT STATISTICS\n")
 	w("───────────────────────────────────────────────────────────────────\n")
 	w("  Total Events:   %d\n", report.Stats.TotalEvents)
-	w("  Events Saved:   %d (circular buffer)\n", len(report.Events))
 	w("  Errors:         %d\n", report.Stats.ErrorCount)
 	w("  Slow Ops:       %d (>100ms)\n", report.Stats.SlowCount)
+	if noiseCount > 0 {
+		w("  Filtered Noise: %d (startup probes)\n", noiseCount)
+	}
+	w("  Shown Below:    %d (errors + slow + context)\n", len(report.Events))
 	w("\n")
 
-	w("EVENTS LEADING TO CRASH (chronological, filtered for signal)\n")
+	// Add network activity summary before detailed events
+	networkEvents := 0
+	networkErrors := 0
+	for _, evt := range report.Events {
+		if evt.Type == "connect" {
+			networkEvents++
+			if evt.Ret < 0 && evt.Ret != -115 { // exclude EINPROGRESS
+				networkErrors++
+			}
+		}
+	}
+
+	if networkEvents > 0 {
+		w("NETWORK ACTIVITY SUMMARY\n")
+		w("───────────────────────────────────────────────────────────────────\n")
+		w("  Connections:    %d\n", networkEvents)
+		w("  Failed:         %d\n", networkErrors)
+		w("\n")
+
+		// Show unique destinations
+		destinations := make(map[string]string)
+		for _, evt := range report.Events {
+			if evt.Network != nil {
+				ip := fmt.Sprintf("%d.%d.%d.%d:%d",
+					evt.Network.DstIP[0], evt.Network.DstIP[1],
+					evt.Network.DstIP[2], evt.Network.DstIP[3],
+					evt.Network.DstPort)
+
+				status := "SUCCESS"
+				if evt.Ret == -111 {
+					status = "ECONNREFUSED"
+				} else if evt.Ret == -110 {
+					status = "ETIMEDOUT"
+				} else if evt.Ret == -115 {
+					status = "ASYNC"
+				} else if evt.Ret < 0 {
+					status = "ERROR"
+				}
+
+				destinations[ip] = status
+			}
+		}
+
+		for dest, status := range destinations {
+			w("  %-30s %s\n", dest, status)
+		}
+		w("\n")
+	}
+
+	w("DETAILED EVENTS (chronological, filtered for relevance)\n")
 	w("═══════════════════════════════════════════════════════════════════\n")
-	w("NOTE: Only showing errors, slow operations, and recent context.\n")
-	w("      50,000 successful reads are not shown - failures are the signal.\n")
-	w("═══════════════════════════════════════════════════════════════════\n\n")
 
 	if len(report.Events) == 0 {
 		w("  (no events captured)\n\n")
 	} else {
 		const EINPROGRESS = 115
+		processStartTime := report.Process.StartTime
+
 		for i, evt := range report.Events {
 			// Mark errors prominently (but not EINPROGRESS)
 			marker := "    "
@@ -228,9 +337,23 @@ func writeTxtReport(path string, report *CrashReport) error {
 				marker = "⚠️  "
 			}
 
+			// Calculate relative time from process start
+			var relativeTime string
+			if evt.Timestamp > processStartTime {
+				offsetNs := evt.Timestamp - processStartTime
+				offsetSec := float64(offsetNs) / 1_000_000_000.0
+				if offsetSec < 1.0 {
+					relativeTime = fmt.Sprintf("+%.0f ms", offsetSec*1000)
+				} else {
+					relativeTime = fmt.Sprintf("+%.2f s", offsetSec)
+				}
+			} else {
+				relativeTime = "+0.00 s"
+			}
+
 			w("[%4d] %s%s\n", i+1, marker, strings.ToUpper(evt.Type))
+			w("       Time:      %s\n", relativeTime)
 			w("       PID:       %d\n", evt.PID)
-			w("       Timestamp: %d ns\n", evt.Timestamp)
 
 			if evt.Latency > 0 {
 				latencyMs := float64(evt.Latency) / 1_000_000.0

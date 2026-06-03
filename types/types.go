@@ -68,6 +68,26 @@ type ConnectEvent struct {
 	Daddr     uint32
 }
 
+type SignalInfo struct {
+	FaultAddr uint64
+	SiCode    int32
+	_         uint32 // padding
+}
+
+type SignalEvent struct {
+	Type        uint32
+	Pid         uint32
+	Tgid        uint32
+	Signal      uint32
+
+	TimestampNs uint64
+	FaultAddr   uint64
+	SiCode      int32
+	StackID     int32
+
+	Comm [16]byte
+}
+
 type ExitEvent struct {
 	Type        uint32
 	Pid         uint32
@@ -77,9 +97,12 @@ type ExitEvent struct {
 	StartTimeNs uint64
 	ExitTimeNs  uint64
 
-	ExitCode int32
-	Signal   int32
-
+	ExitCode  int32
+	Signal    int32
 	GroupDead uint8
-	Comm      [16]byte
+	_         [3]uint8 // padding
+
+	SigInfo SignalInfo
+
+	Comm [16]byte
 }

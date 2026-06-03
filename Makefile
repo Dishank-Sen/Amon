@@ -4,7 +4,7 @@ build:
 	@go build -o bin/$(APP) ./cmd/amon/
 
 gen:
-	@clang -target bpf -g -O2 -c bpf/trace.c -o internal/bpf/trace.o
+	@clang -target bpf -D__TARGET_ARCH_x86 -g -O2 -c bpf/trace.c -o internal/bpf/trace.o
 
 run: build
 	@sudo bin/$(APP)
